@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RootNamespace>WinFormsHarness</RootNamespace>
+    <AssemblyName>WinFormsHarness</AssemblyName>
+    <!-- Standalone "third-party-like" app: speaks only the cooperative protocol, no AppScale.Core reference. -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+
+</Project>

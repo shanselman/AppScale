@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>appscale</AssemblyName>
+    <RootNamespace>AppScale.Cli</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AppScale.Core\AppScale.Core.csproj" />
+  </ItemGroup>
+</Project>

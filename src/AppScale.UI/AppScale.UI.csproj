@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <RootNamespace>AppScale.UI</RootNamespace>
+    <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- Avoid System.Windows.Forms / System.Drawing implicit usings clashing with WPF types. -->
+    <ImplicitUsings>disable</ImplicitUsings>
+    <!-- DPI awareness (PerMonitorV2) is declared in app.manifest, the WPF way; the WinForms analyzer hint does not apply. -->
+    <NoWarn>$(NoWarn);WFO0003</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AppScale.Core\AppScale.Core.csproj" />
+  </ItemGroup>
+</Project>

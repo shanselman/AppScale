@@ -1,0 +1,9 @@
+LIBRARY "AppScale.Native.dll"
+EXPORTS
+    AppScaleNative_Initialize @1
+    AppScaleNative_SetEffectiveDpi
+    AppScaleNative_SetEnabledMask
+    AppScaleNative_GetRealApis
+    AppScaleNative_GetStatsJson
+    AppScaleNative_ResetStats
+    AppScaleNative_Shutdown

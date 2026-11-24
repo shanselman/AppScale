@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>WpfHarness</RootNamespace>
+    <AssemblyName>WpfHarness</AssemblyName>
+    <!-- PerMonitorV2 via manifest. Standalone "third-party-like" app: no AppScale.Core reference. -->
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <StartupObject>WpfHarness.Program</StartupObject>
+  </PropertyGroup>
+
+</Project>
