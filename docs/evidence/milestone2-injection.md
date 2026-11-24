@@ -280,11 +280,65 @@ Interpretation:
 - **Input and accessibility:** input accuracy, accessibility/UI Automation, IME, drag/drop and touch were not
   tested after injection.
 - **Robustness:** long-running stability, unloading, crash-safety and CPU overhead were not measured.
-- **Thread coverage:** in `--inject` mode, Detours attach runs on the remote thread. Hooks are process-wide
-  code patches, but threads blocked inside a hooked function at attach time are not updated
-  (`DetourUpdateThread` is only called for the current thread).
+- **Thread coverage:** in `--inject` mode, the agent enumerates the process's threads before
+  `DetourTransactionBegin` and passes every other thread to `DetourUpdateThread` (see "Hardening after
+  review"). Threads created after that snapshot are not suspended; they start at their own start routine, so
+  they cannot be inside the patched bytes. Detours still allocates one small node per `DetourUpdateThread`
+  call while earlier threads are already suspended. A deadlock against a suspended thread that holds the
+  heap lock is therefore theoretically possible. It was not observed, and it was not stress-tested.
 - **Anti-cheat and code-integrity:** apps that use anti-cheat or code-integrity protection (Chromium sandboxed
   children, games, etc.) were not tested and may reject the DLL.
+
+## Hardening after review
+
+An independent code review of commit d5d1841 found four bugs. All four are fixed.
+
+| # | Severity | Bug | Fix |
+|---|----------|-----|-----|
+| 1 | High | `Inject` did not check the result of the remote-thread `WaitForSingleObject`. On timeout, `STILL_ACTIVE` (259) was read as success, and `VirtualFreeEx` freed the path buffer while `LoadLibraryW` could still read it. | `VirtualFreeEx` now runs only after `WAIT_OBJECT_0`; on any other wait result the buffer is leaked deliberately and the injector fails with 22 / `loadTimeout`. A load succeeds only when the exit code is non-zero and not `STILL_ACTIVE` (otherwise 21). `--timeout` must be a decimal value from 1000 to 600000 ms. `--inject`/`--check` pids and `--dpi` are now parsed strictly too, and malformed values return 2. |
+| 2 | Medium | Each hook read `g_effectiveDpi` twice, once for the "enabled" check and once for the result. A concurrent reset between the two reads could return a DPI or metric of 0. | Every hook reads `g_effectiveDpi` once into a local. That one value drives the check, the return value, and the arguments to `GetSystemMetricsForDpi` and `SystemParametersInfoForDpi`. |
+| 3 | Medium | `AttachAll` passed only the current thread to `DetourUpdateThread`, so in inject mode, live threads could be executing the bytes being patched. | In inject mode, a Toolhelp snapshot opens the handles of all other threads before `DetourTransactionBegin`, into a vector sized beforehand. The attaches are queued first, then every other thread is passed to `DetourUpdateThread`, then the transaction commits. The handles are closed afterwards, and a failed commit aborts. Launch mode (from `DllMain`, before `main`) and explicit mode are unchanged. Explicit-mode `Shutdown` also updates the other threads. `agentStart` now logs `threadsUpdatedAtInstall`. |
+| 4 | Medium | TOCTOU: `CheckTarget` opened the target by pid and closed it, then `Inject` reopened it by pid. | `OpenTarget` now opens the target once by pid, with query, create-thread, VM-operation/read/write and synchronize rights. Every check runs on that handle: alive, x64, elevation, protection, AppContainer, user and session (from `TokenSessionId`), denylist, and "module already loaded" (`EnumProcessModulesEx`). The injection then goes through the same handle. If the full-rights open fails, the target is reopened query-only, solely to report the correct refusal code (for example 11 for an elevated target). |
+
+### Re-test (Release build, fresh `build\native`, measured)
+
+**Build and self-tests**
+
+```powershell
+Remove-Item -Recurse -Force build\native; .\scripts\build-native.ps1 -Configuration Release   # clean, /W4 /WX
+.\tests\Win32Harness\Run-SelfTests.ps1                                                           # drift, synthetic, monitors-os, monitors-192, detours-192: all PASS
+```
+
+**Inject**
+
+```powershell
+$bin='artifacts\bin\Win32Harness\release'
+Start-Process $bin\Win32Harness.exe -ArgumentList '--no-cooperative --log <h.jsonl>'
+& $bin\AppScale.Injector.exe --check <pid>
+& $bin\AppScale.Injector.exe --inject <pid> --dpi 192 --log <n.jsonl>
+.\tests\Win32Harness\Invoke-ProtocolProbe.ps1 -ProcessId <pid> -Sequence 192,0
+```
+
+**Launch**
+
+```powershell
+& $bin\AppScale.Injector.exe --launch $bin\Win32Harness.exe --dpi 192 --log <n.jsonl> -- --no-cooperative --log <h.jsonl>
+```
+
+| Case | Result |
+|------|--------|
+| `--check <pid>` (no-cooperative harness) | exit 0 |
+| `--inject <pid> --dpi 192` | exit 0, ack 1, `loadMode` 2, `threadsUpdatedAtInstall` = **4** |
+| Probe SetDpi 192, then 0 (inject) | 192: effective 192 / os 144, client 1440x680. 0: effective 144 / os 144, client 1080x510 |
+| Second `--inject` | exit 17 (`alreadyInjected`) |
+| `--launch ... --dpi 192` | exit 0, ack 1, `loadMode` 1, `threadsUpdatedAtInstall` = 0 (no other threads exist yet); first shown layout 1440x680 with GetDpiForWindow 192 against a true OS DPI of 144 |
+| Probe SetDpi 192, then 0 (launch) | 192: effective 192 / os 144. 0: effective 144 / os 144, client 1080x510 |
+| `--timeout abc`, `10`, `999`, `99999999999` | exit 2 for each |
+| `--inject 12x4`, `--inject 0`, `--check -5`, `--dpi 19x2` | exit 2 for each |
+
+The `loadTimeout` path (bug 1) is covered by code review only: no run was made in which the remote
+`LoadLibraryW` exceeded 1000 ms. The bug-2 race and the bug-3 thread fix-up were not stress-tested. They are
+verified by construction, and by the absence of crashes in the runs above.
 
 ## Decision gate
 

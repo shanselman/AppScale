@@ -16,7 +16,9 @@ jobs:
       - name: Build native + managed, unit tests
         shell: pwsh
         run: scripts/build.ps1
-      - name: Integration tests (owned harnesses, interactive desktop session)
+      # Hosted runners are elevated and 1024x768, so the end-to-end tests self-skip there with a stated reason.
+      # They are required to pass on a non-elevated desktop: scripts/build.ps1 -Integration
+      - name: Integration tests (skip on elevated / small-display runners)
         shell: pwsh
         run: |
           $env:APPSCALE_REQUIRE_HARNESSES = '1'

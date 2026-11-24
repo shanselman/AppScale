@@ -13,19 +13,35 @@ public sealed class ProfileWatcher(ScaleController controller, TimeSpan? interva
     private readonly TimeSpan _interval = interval ?? TimeSpan.FromMilliseconds(750);
     private readonly Dictionary<int, int> _attempts = new();
     private readonly HashSet<int> _done = new();
+    private readonly object _gate = new();
     private Timer? _timer;
-    private int _busy;
+    private volatile bool _stopped;
 
     public event Action<TargetInfo, ScaleResult>? Applied;
 
     public bool IsRunning => _timer is not null;
 
-    public void Start() => _timer ??= new Timer(_ => Tick(), null, TimeSpan.Zero, _interval);
+    public void Start()
+    {
+        _stopped = false;
+        _timer ??= new Timer(_ =>
+        {
+            if (!Monitor.TryEnter(_gate)) return; // previous scan still running
+            try { Tick(); } finally { Monitor.Exit(_gate); }
+        }, null, TimeSpan.Zero, _interval);
+    }
 
+    /// <summary>Stops the timer and waits for any in-flight scan, so callers can safely ResetAll afterwards.</summary>
     public void Stop()
     {
-        _timer?.Dispose();
-        _timer = null;
+        _stopped = true;
+        if (_timer is { } t)
+        {
+            using var disposed = new ManualResetEvent(false);
+            if (t.Dispose(disposed)) disposed.WaitOne();
+            _timer = null;
+        }
+        lock (_gate) { }
     }
 
     public void Dispose() => Stop();
@@ -34,8 +50,7 @@ public sealed class ProfileWatcher(ScaleController controller, TimeSpan? interva
     public IReadOnlyList<(TargetInfo Target, ScaleResult Result)> Tick()
     {
         var results = new List<(TargetInfo, ScaleResult)>();
-        if (Interlocked.Exchange(ref _busy, 1) == 1) return results;
-        try
+        lock (_gate)
         {
             var settings = controller.Store.Load();
             if (!settings.OptedIn || settings.EmergencyDisabled) return results;
@@ -48,6 +63,7 @@ public sealed class ProfileWatcher(ScaleController controller, TimeSpan? interva
 
             foreach (var w in windows)
             {
+                if (_stopped) break;
                 if (w.Executable is null || _done.Contains(w.ProcessId)) continue;
                 if (!profiles.TryGetValue(w.Executable.Key, out var profile)) continue;
                 int attempts = _attempts.GetValueOrDefault(w.ProcessId);
@@ -61,7 +77,6 @@ public sealed class ProfileWatcher(ScaleController controller, TimeSpan? interva
                 Applied?.Invoke(w, r);
             }
         }
-        finally { Volatile.Write(ref _busy, 0); }
         return results;
     }
 }

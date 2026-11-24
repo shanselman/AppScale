@@ -47,3 +47,5 @@ processes), and monitor disconnect while an override is active.
   monitor DPI. It can't be lied to from inside the process.
 - **Out of reach:** system-aware and unaware applications are bitmap-scaled by Windows, so only visual magnification
   can help them.
+- **Small displays:** at 200–250 % on a 1024×768 display, Windows clamps the window and controls can be clipped. See
+  the [test report](test-report.md).

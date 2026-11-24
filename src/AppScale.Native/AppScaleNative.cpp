@@ -17,9 +17,11 @@
 #include <detours.h>
 #include <shellscalingapi.h>
 #include <intrin.h>
+#include <tlhelp32.h>
 
 #include <atomic>
 #include <string>
+#include <vector>
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -157,8 +159,10 @@ bool RecordCaller(HookStats& s, void* returnAddress) {
     return system;
 }
 
-bool Enabled(HookIndex h) {
-    return (g_enabledMask.load() & g_stats[h].bit) != 0 && g_effectiveDpi.load() != 0;
+// `dpi` is the caller's single snapshot of g_effectiveDpi: every hook loads it exactly once and uses
+// that same value for the decision and the result, so a concurrent reset can never yield 0.
+bool Enabled(HookIndex h, UINT dpi) {
+    return (g_enabledMask.load() & g_stats[h].bit) != 0 && dpi != 0;
 }
 
 bool OnOwnerThread() { return g_ownerThread == 0 || GetCurrentThreadId() == g_ownerThread; }
@@ -175,8 +179,8 @@ bool PerMonitor(DPI_AWARENESS_CONTEXT ctx) {
 bool ThreadPerMonitor() { return PerMonitor(GetThreadDpiAwarenessContext()); }
 
 // Shared decision for the window-less APIs. Order matters only for the statistics.
-bool ShouldOverrideThreadScoped(HookStats& s, HookIndex h, bool systemCaller) {
-    if (!Enabled(h)) { s.passthroughDisabled++; return false; }
+bool ShouldOverrideThreadScoped(HookStats& s, HookIndex h, bool systemCaller, UINT dpi) {
+    if (!Enabled(h, dpi)) { s.passthroughDisabled++; return false; }
     if (!OnOwnerThread()) { s.passthroughNotOwned++; return false; }
     if (systemCaller && !g_includeSystemCallers) { s.passthroughSystemCaller++; return false; }
     if (!ThreadPerMonitor()) { s.passthroughNotPerMonitor++; return false; }
@@ -196,9 +200,10 @@ UINT WINAPI Hook_GetDpiForWindow(HWND hwnd) {
     DWORD err = GetLastError();
     RecordCaller(s, ra);
     UINT result = real;
+    const UINT dpi = g_effectiveDpi.load();
     if (real == 0) {
         s.passthroughError++;  // invalid hwnd etc.: preserve the documented 0 result
-    } else if (!Enabled(kWindow)) {
+    } else if (!Enabled(kWindow, dpi)) {
         s.passthroughDisabled++;
     } else if (!WindowOwned(hwnd)) {
         s.passthroughNotOwned++;
@@ -206,7 +211,7 @@ UINT WINAPI Hook_GetDpiForWindow(HWND hwnd) {
         s.passthroughNotPerMonitor++;  // unaware/system-aware child HWNDs are DWM-scaled: keep the truth
     } else {
         s.overridden++;
-        result = g_effectiveDpi.load();
+        result = dpi;
     }
     SetLastError(err);
     return result;
@@ -225,11 +230,12 @@ UINT WINAPI Hook_GetDpiForSystem() {
     DWORD err = GetLastError();
     bool sys = RecordCaller(s, ra);
     UINT result = real;
+    const UINT dpi = g_effectiveDpi.load();
     if (real == 0) {
         s.passthroughError++;
-    } else if (ShouldOverrideThreadScoped(s, kSystem, sys)) {
+    } else if (ShouldOverrideThreadScoped(s, kSystem, sys, dpi)) {
         s.overridden++;
-        result = g_effectiveDpi.load();
+        result = dpi;
     }
     SetLastError(err);
     return result;
@@ -248,13 +254,14 @@ UINT WINAPI Hook_GetSystemDpiForProcess(HANDLE process) {
     DWORD err = GetLastError();
     bool sys = RecordCaller(s, ra);
     UINT result = real;
+    const UINT dpi = g_effectiveDpi.load();
     if (real == 0) {
         s.passthroughError++;
     } else if (process != GetCurrentProcess() && GetProcessId(process) != GetCurrentProcessId()) {
         s.passthroughOtherIndex++;  // another process: never lie about it
-    } else if (ShouldOverrideThreadScoped(s, kProcess, sys)) {
+    } else if (ShouldOverrideThreadScoped(s, kProcess, sys, dpi)) {
         s.overridden++;
-        result = g_effectiveDpi.load();
+        result = dpi;
     }
     SetLastError(err);
     return result;
@@ -278,9 +285,10 @@ int WINAPI Hook_GetDeviceCaps(HDC hdc, int index) {
     DWORD err = GetLastError();
     bool sys = RecordCaller(s, ra);
     int result = real;
+    const UINT dpi = g_effectiveDpi.load();
     if (real == 0) {
         s.passthroughError++;
-    } else if (!ShouldOverrideThreadScoped(s, kDevCaps, sys)) {
+    } else if (!ShouldOverrideThreadScoped(s, kDevCaps, sys, dpi)) {
         // counted inside
     } else if (Real_GetDeviceCaps(hdc, TECHNOLOGY) != DT_RASDISPLAY) {
         s.passthroughOtherIndex++;  // printers, metafiles keep real values
@@ -290,7 +298,7 @@ int WINAPI Hook_GetDeviceCaps(HDC hdc, int index) {
             s.passthroughNotOwned++;
         } else {
             s.overridden++;
-            result = static_cast<int>(g_effectiveDpi.load());
+            result = static_cast<int>(dpi);
         }
     }
     SetLastError(err);
@@ -309,13 +317,14 @@ HRESULT WINAPI Hook_GetDpiForMonitor(HMONITOR monitor, int type, UINT* dpiX, UIN
     HRESULT hr = Real_GetDpiForMonitor(monitor, type, dpiX, dpiY);
     DWORD err = GetLastError();
     bool sys = RecordCaller(s, ra);
+    const UINT dpi = g_effectiveDpi.load();
     if (FAILED(hr) || dpiX == nullptr || dpiY == nullptr) {
         s.passthroughError++;
     } else if (type != MDT_EFFECTIVE_DPI_VALUE) {
         s.passthroughOtherIndex++;
-    } else if (ShouldOverrideThreadScoped(s, kMonitor, sys)) {
+    } else if (ShouldOverrideThreadScoped(s, kMonitor, sys, dpi)) {
         s.overridden++;
-        *dpiX = *dpiY = g_effectiveDpi.load();
+        *dpiX = *dpiY = dpi;
     }
     SetLastError(err);
     return hr;
@@ -347,16 +356,17 @@ int WINAPI Hook_GetSystemMetrics(int index) {
     DWORD err = GetLastError();
     bool sys = RecordCaller(s, ra);
     int result = real;
+    const UINT dpi = g_effectiveDpi.load();
     if (IsGeometryMetric(index)) {
         s.passthroughOtherIndex++;
-    } else if (ShouldOverrideThreadScoped(s, kMetrics, sys)) {
+    } else if (ShouldOverrideThreadScoped(s, kMetrics, sys, dpi)) {
         // Only rescale indices that GetSystemMetricsForDpi reproduces exactly at the system DPI.
         const UINT sysDpi = Real_GetDpiForSystem();
         if (GetSystemMetricsForDpi(index, sysDpi) != real) {
             s.passthroughOtherIndex++;
         } else {
             s.overridden++;
-            result = GetSystemMetricsForDpi(index, g_effectiveDpi.load());
+            result = GetSystemMetricsForDpi(index, dpi);
         }
     }
     SetLastError(err);
@@ -377,9 +387,10 @@ BOOL WINAPI Hook_SystemParametersInfoW(UINT action, UINT param, PVOID pv, UINT w
     void* ra = _ReturnAddress();
     s.calls++;
     bool sys = RecordCaller(s, ra);
-    if (ShouldOverrideThreadScoped(s, kSpi, sys)) {
+    const UINT dpi = g_effectiveDpi.load();
+    if (ShouldOverrideThreadScoped(s, kSpi, sys, dpi)) {
         // SystemParametersInfoForDpi requires fWinIni = 0 for these GET actions.
-        if (SystemParametersInfoForDpi(action, param, pv, 0, g_effectiveDpi.load())) {
+        if (SystemParametersInfoForDpi(action, param, pv, 0, dpi)) {
             s.overridden++;
             return TRUE;
         }
@@ -407,10 +418,46 @@ void Detach(T* real, void* hook) {
     DetourDetach(reinterpret_cast<PVOID*>(real), hook);
 }
 
-LONG AttachAll(UINT32 mask) {
+// Handles of every other thread in this process, opened BEFORE DetourTransactionBegin so that no
+// Toolhelp/heap work happens while Detours holds threads suspended. The vector is fully sized here
+// and never grows afterwards. Threads created after the snapshot start at their start routine, so
+// their instruction pointer cannot be inside the bytes being patched.
+struct OtherThreads {
+    std::vector<HANDLE> handles;
+    ~OtherThreads() {
+        for (HANDLE h : handles) CloseHandle(h);
+    }
+    void Open() {
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) return;
+        const DWORD pid = GetCurrentProcessId();
+        const DWORD self = GetCurrentThreadId();
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        size_t count = 0;
+        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te))
+            if (te.th32OwnerProcessID == pid && te.th32ThreadID != self) ++count;
+        handles.reserve(count);
+        te.dwSize = sizeof(te);
+        for (BOOL ok = Thread32First(snap, &te); ok && handles.size() < count; ok = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+            HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_LIMITED_INFORMATION,
+                                  FALSE, te.th32ThreadID);
+            if (h) handles.push_back(h);  // a thread that already exited is simply skipped
+        }
+        CloseHandle(snap);
+    }
+};
+UINT32 g_lastUpdatedThreads = 0;
+
+// Attaches are queued first (they allocate Detours bookkeeping and trampolines); threads are only
+// suspended afterwards, immediately before the commit, so the suspended window is as short as
+// possible. Detours itself still allocates one small node per DetourUpdateThread call.
+LONG AttachAll(UINT32 mask, bool suspendOtherThreads) {
+    OtherThreads others;
+    if (suspendOtherThreads) others.Open();
     LONG rc = DetourTransactionBegin();
     if (rc != NO_ERROR) return rc;
-    DetourUpdateThread(GetCurrentThread());
     if (mask & APPSCALE_HOOK_GETDPIFORWINDOW) Attach(&Real_GetDpiForWindow, reinterpret_cast<void*>(Hook_GetDpiForWindow));
     if (mask & APPSCALE_HOOK_GETDPIFORSYSTEM) Attach(&Real_GetDpiForSystem, reinterpret_cast<void*>(Hook_GetDpiForSystem));
     if (mask & APPSCALE_HOOK_GETDEVICECAPS) Attach(&Real_GetDeviceCaps, reinterpret_cast<void*>(Hook_GetDeviceCaps));
@@ -418,13 +465,18 @@ LONG AttachAll(UINT32 mask) {
     if (mask & APPSCALE_HOOK_GETSYSTEMDPIFORPROCESS) Attach(&Real_GetSystemDpiForProcess, reinterpret_cast<void*>(Hook_GetSystemDpiForProcess));
     if (mask & APPSCALE_HOOK_GETSYSTEMMETRICS) Attach(&Real_GetSystemMetrics, reinterpret_cast<void*>(Hook_GetSystemMetrics));
     if (mask & APPSCALE_HOOK_SYSTEMPARAMETERSINFO) Attach(&Real_SystemParametersInfoW, reinterpret_cast<void*>(Hook_SystemParametersInfoW));
-    return DetourTransactionCommit();
+    for (HANDLE h : others.handles) DetourUpdateThread(h);
+    rc = DetourTransactionCommit();
+    if (rc != NO_ERROR) DetourTransactionAbort();
+    g_lastUpdatedThreads = static_cast<UINT32>(others.handles.size());
+    return rc;
 }
 
-LONG DetachAll() {
+LONG DetachAll(bool suspendOtherThreads) {
+    OtherThreads others;
+    if (suspendOtherThreads) others.Open();
     LONG rc = DetourTransactionBegin();
     if (rc != NO_ERROR) return rc;
-    DetourUpdateThread(GetCurrentThread());
     if (g_stats[kWindow].installed) Detach(&Real_GetDpiForWindow, reinterpret_cast<void*>(Hook_GetDpiForWindow));
     if (g_stats[kSystem].installed) Detach(&Real_GetDpiForSystem, reinterpret_cast<void*>(Hook_GetDpiForSystem));
     if (g_stats[kDevCaps].installed) Detach(&Real_GetDeviceCaps, reinterpret_cast<void*>(Hook_GetDeviceCaps));
@@ -432,7 +484,10 @@ LONG DetachAll() {
     if (g_stats[kProcess].installed) Detach(&Real_GetSystemDpiForProcess, reinterpret_cast<void*>(Hook_GetSystemDpiForProcess));
     if (g_stats[kMetrics].installed) Detach(&Real_GetSystemMetrics, reinterpret_cast<void*>(Hook_GetSystemMetrics));
     if (g_stats[kSpi].installed) Detach(&Real_SystemParametersInfoW, reinterpret_cast<void*>(Hook_SystemParametersInfoW));
-    return DetourTransactionCommit();
+    for (HANDLE h : others.handles) DetourUpdateThread(h);
+    rc = DetourTransactionCommit();
+    if (rc != NO_ERROR) DetourTransactionAbort();
+    return rc;
 }
 
 bool ValidDpi(UINT32 dpi) { return dpi == 0 || (dpi >= 72 && dpi <= 240); }
@@ -457,7 +512,7 @@ bool ResolveReals() {
 
 // Caller holds g_initLock.
 HRESULT InstallLocked(UINT32 installMask, UINT32 enabledMask, UINT32 effectiveDpi, DWORD ownerThread, bool includeSystemCallers,
-                      const char* mode) {
+                      const char* mode, bool suspendOtherThreads) {
     if (g_initialized) return HRESULT_FROM_WIN32(ERROR_ALREADY_INITIALIZED);
     if (!ResolveReals()) return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
     InitSystemDirs();
@@ -465,11 +520,8 @@ HRESULT InstallLocked(UINT32 installMask, UINT32 enabledMask, UINT32 effectiveDp
     g_includeSystemCallers = includeSystemCallers;
     g_effectiveDpi = effectiveDpi;
     g_enabledMask = enabledMask & installMask;
-    LONG rc = installMask ? AttachAll(installMask) : NO_ERROR;
-    if (rc != NO_ERROR) {
-        DetourTransactionAbort();
-        return HRESULT_FROM_WIN32(rc);
-    }
+    LONG rc = installMask ? AttachAll(installMask, suspendOtherThreads) : NO_ERROR;
+    if (rc != NO_ERROR) return HRESULT_FROM_WIN32(rc);
     for (auto& s : g_stats) s.installed = (installMask & s.bit) != 0;
     g_mode = mode;
     g_initialized = true;
@@ -484,6 +536,7 @@ namespace appscale {
 UINT RealGetDpiForWindow(HWND hwnd) { return Real_GetDpiForWindow ? Real_GetDpiForWindow(hwnd) : ::GetDpiForWindow(hwnd); }
 UINT RealGetDpiForSystem() { return Real_GetDpiForSystem ? Real_GetDpiForSystem() : ::GetDpiForSystem(); }
 UINT32 EffectiveDpi() { return g_effectiveDpi.load(); }
+UINT32 ThreadsUpdatedAtInstall() { return g_lastUpdatedThreads; }
 void SetEffectiveDpiInternal(UINT32 dpi) { g_effectiveDpi = dpi; }
 
 UINT32 InstalledMask() {
@@ -493,10 +546,10 @@ UINT32 InstalledMask() {
     return m;
 }
 
-HRESULT InstallProcessWide(UINT32 installMask, UINT32 effectiveDpi, bool includeSystemCallers) {
+HRESULT InstallProcessWide(UINT32 installMask, UINT32 effectiveDpi, bool includeSystemCallers, bool suspendOtherThreads) {
     AcquireSRWLockExclusive(&g_initLock);
     HRESULT hr = InstallLocked(installMask & APPSCALE_HOOK_ALL, installMask & APPSCALE_HOOK_ALL, effectiveDpi, 0,
-                               includeSystemCallers, "injected");
+                               includeSystemCallers, "injected", suspendOtherThreads);
     ReleaseSRWLockExclusive(&g_initLock);
     return hr;
 }
@@ -512,7 +565,8 @@ extern "C" HRESULT WINAPI AppScaleNative_Initialize(const AppScaleNativeConfig* 
     if (!ValidDpi(config->effectiveDpi) || (config->installMask & ~APPSCALE_HOOK_ALL) != 0 || config->ownerThreadId == 0)
         return E_INVALIDARG;
     AcquireSRWLockExclusive(&g_initLock);
-    HRESULT hr = InstallLocked(config->installMask, config->enabledMask, config->effectiveDpi, config->ownerThreadId, true, "explicit");
+    HRESULT hr = InstallLocked(config->installMask, config->enabledMask, config->effectiveDpi, config->ownerThreadId, true, "explicit",
+                               false);
     ReleaseSRWLockExclusive(&g_initLock);
     return hr;
 }
@@ -565,6 +619,7 @@ extern "C" HRESULT WINAPI AppScaleNative_GetStatsJson(char* buffer, UINT32 cb, U
                     ",\"effectiveDpi\":" + std::to_string(g_effectiveDpi.load()) +
                     ",\"enabledMask\":" + std::to_string(g_enabledMask.load()) +
                     ",\"ownerThreadId\":" + std::to_string(g_ownerThread) +
+                    ",\"threadsUpdatedAtInstall\":" + std::to_string(g_lastUpdatedThreads) +
                     ",\"includeSystemCallers\":" + (g_includeSystemCallers ? "true" : "false") + ",\"hooks\":[";
     for (int h = 0; h < kHookCount; ++h) {
         HookStats& s = g_stats[h];
@@ -619,7 +674,7 @@ extern "C" HRESULT WINAPI AppScaleNative_Shutdown(void) {
         return S_FALSE;
     }
     g_enabledMask = 0;
-    LONG rc = DetachAll();
+    LONG rc = DetachAll(true);
     if (rc == NO_ERROR) {
         for (auto& s : g_stats) s.installed = false;
         g_initialized = false;
@@ -636,7 +691,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     } else if (reason == DLL_PROCESS_DETACH && reserved == nullptr && g_initialized && g_ownerThread != 0) {
         // Explicit mode FreeLibrary while hooks are live: remove them so no patched code jumps into an unloaded image.
         g_enabledMask = 0;
-        DetachAll();
+        DetachAll(false);
         g_initialized = false;
     }
     return TRUE;

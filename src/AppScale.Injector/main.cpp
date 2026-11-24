@@ -7,12 +7,14 @@
 //   AppScale.Injector --check <pid>        (eligibility only, never touches the target)
 //
 // Safety: refuses elevated, protected, WOW64/non-x64, AppContainer, other-user/other-session and
-// denylisted system processes before opening any write/thread handle. Prints one JSON line.
+// denylisted system processes. The target is opened once by pid; every check and the injection use that
+// single handle (no pid-reuse window), and nothing is written before all checks pass. Prints one JSON line.
 #include <windows.h>
 
 #include <detours.h>
-#include <tlhelp32.h>
+#include <psapi.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cwchar>
 #include <string>
@@ -42,6 +44,9 @@ enum Exit : int {
     kHookFailed = 23,
     kTargetExited = 24,
 };
+
+constexpr unsigned long kMinTimeoutMs = 1000;
+constexpr unsigned long kMaxTimeoutMs = 600000;
 
 std::string Utf8(const std::wstring& w) {
     if (w.empty()) return {};
@@ -138,18 +143,39 @@ std::vector<BYTE> TokenUser_(HANDLE token) {
     return buf;
 }
 
-// Eligibility checks that need only PROCESS_QUERY_LIMITED_INFORMATION. Returns kOk or a refusal.
-int CheckTarget(DWORD pid, Result& r) {
+constexpr DWORD kInjectAccess = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_QUERY_INFORMATION | PROCESS_CREATE_THREAD |
+                                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | SYNCHRONIZE;
+
+// Opens the target exactly once. Every eligibility check and the injection itself then use this same
+// handle, so the pid cannot be recycled between check and use. If the full rights are denied, a
+// query-only handle is opened purely to classify the refusal; *injectable is false and nothing is
+// ever written through it.
+HANDLE OpenTarget(DWORD pid, Result& r, bool* injectable, int* rc) {
+    *injectable = false;
+    *rc = kOk;
+    HANDLE h = OpenProcess(kInjectAccess, FALSE, pid);
+    if (h) {
+        *injectable = true;
+        return h;
+    }
+    const DWORD fullErr = GetLastError();
+    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+    if (!h) *rc = Fail(r, kOpenFailed, "openProcess", "cannot open process (error " + std::to_string(fullErr) + ")");
+    return h;
+}
+
+// Eligibility checks on an already-open handle. Returns kOk or a refusal.
+int CheckTarget(HANDLE h, Result& r) {
     HANDLE self = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &self)) return Fail(r, kOpenFailed, "selfToken", "cannot open own token");
     const bool selfElevated = TokenElevated(self);
     auto selfUser = TokenUser_(self);
+    DWORD sessSelf = 0, cbS = 0;
+    const bool selfSessOk = GetTokenInformation(self, TokenSessionId, &sessSelf, sizeof(sessSelf), &cbS) != FALSE;
     CloseHandle(self);
     if (selfElevated)
         return Fail(r, kInjectorElevated, "injectorElevated", "AppScale.Injector must not run elevated; run it as the normal user");
 
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!h) return Fail(r, kOpenFailed, "openProcess", "cannot query process (error " + std::to_string(GetLastError()) + ")");
     wchar_t image[MAX_PATH * 2]{};
     DWORD cch = ARRAYSIZE(image);
     QueryFullProcessImageNameW(h, 0, image, &cch);
@@ -157,9 +183,14 @@ int CheckTarget(DWORD pid, Result& r) {
     int rc = kOk;
     USHORT processMachine = 0, nativeMachine = 0;
     PROCESS_PROTECTION_LEVEL_INFORMATION prot{};
-    DWORD sessSelf = 0, sessTarget = 0;
+    DWORD sessTarget = 0, cbT = 0;
     HANDLE tok = nullptr;
-    if (IsDenylisted(image)) {
+    DWORD exitCode = 0;
+    if (!GetExitCodeProcess(h, &exitCode) || exitCode != STILL_ACTIVE) {
+        rc = Fail(r, kTargetExited, "targetExited", "target process is not running");
+    } else if (image[0] == 0) {
+        rc = Fail(r, kOpenFailed, "imageName", "cannot query target image name; refusing");
+    } else if (IsDenylisted(image)) {
         rc = Fail(r, kDenylisted, "denylisted", "system/shell/security process; AppScale never injects into these");
     } else if (!IsWow64Process2(h, &processMachine, &nativeMachine) || processMachine != IMAGE_FILE_MACHINE_UNKNOWN ||
                nativeMachine != IMAGE_FILE_MACHINE_AMD64) {
@@ -167,14 +198,14 @@ int CheckTarget(DWORD pid, Result& r) {
     } else if (GetProcessInformation(h, ProcessProtectionLevelInfo, &prot, sizeof(prot)) &&
                prot.ProtectionLevel != PROTECTION_LEVEL_NONE) {
         rc = Fail(r, kProtected, "protected", "target is a protected process");
-    } else if (!ProcessIdToSessionId(GetCurrentProcessId(), &sessSelf) || !ProcessIdToSessionId(pid, &sessTarget) || sessSelf != sessTarget) {
-        rc = Fail(r, kOtherUserOrSession, "otherSession", "target runs in another session");
     } else if (!OpenProcessToken(h, TOKEN_QUERY, &tok)) {
         rc = Fail(r, kElevated, "tokenDenied", "cannot query target token (likely elevated or another user); refusing");
     } else {
         auto user = TokenUser_(tok);
         DWORD ac = 0, cb = 0;
-        if (TokenElevated(tok)) {
+        if (!selfSessOk || !GetTokenInformation(tok, TokenSessionId, &sessTarget, sizeof(sessTarget), &cbT) || sessSelf != sessTarget) {
+            rc = Fail(r, kOtherUserOrSession, "otherSession", "target runs in another session");
+        } else if (TokenElevated(tok)) {
             rc = Fail(r, kElevated, "elevated", "target is elevated; AppScale only touches non-elevated processes");
         } else if (user.empty() || selfUser.empty() ||
                    !EqualSid(reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid, reinterpret_cast<TOKEN_USER*>(selfUser.data())->User.Sid)) {
@@ -184,18 +215,26 @@ int CheckTarget(DWORD pid, Result& r) {
         }
         CloseHandle(tok);
     }
-    CloseHandle(h);
     return rc;
 }
 
-bool ModuleLoaded(DWORD pid, const wchar_t* name) {
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid);
-    if (snap == INVALID_HANDLE_VALUE) return false;
-    MODULEENTRY32W me{sizeof(me)};
-    bool found = false;
-    for (BOOL ok = Module32FirstW(snap, &me); ok && !found; ok = Module32NextW(snap, &me)) found = _wcsicmp(me.szModule, name) == 0;
-    CloseHandle(snap);
-    return found;
+// Module check through the same process handle (needs PROCESS_QUERY_INFORMATION | PROCESS_VM_READ).
+bool ModuleLoaded(HANDLE h, const wchar_t* name) {
+    std::vector<HMODULE> mods(512);
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        DWORD needed = 0;
+        if (!EnumProcessModulesEx(h, mods.data(), static_cast<DWORD>(mods.size() * sizeof(HMODULE)), &needed, LIST_MODULES_64BIT))
+            return false;
+        if (needed > mods.size() * sizeof(HMODULE)) {
+            mods.resize(needed / sizeof(HMODULE) + 64);
+            continue;
+        }
+        wchar_t base[MAX_PATH];
+        for (DWORD i = 0; i < needed / sizeof(HMODULE); ++i)
+            if (GetModuleBaseNameW(h, mods[i], base, MAX_PATH) && _wcsicmp(base, name) == 0) return true;
+        return false;
+    }
+    return false;
 }
 
 std::wstring DefaultLog(DWORD pid) {
@@ -341,16 +380,21 @@ int Inject(const Options& o, Result& r) {
     r.mode = "inject";
     r.pid = o.pid;
     if (o.pid == GetCurrentProcessId() || o.pid <= 4) return Fail(r, kDenylisted, "invalidPid", "refusing this pid");
-    int rc = CheckTarget(o.pid, r);
-    if (rc != kOk) return rc;
-    if (ModuleLoaded(o.pid, L"AppScale.Native.dll")) {
+    bool injectable = false;
+    int rc = kOk;
+    HANDLE h = OpenTarget(o.pid, r, &injectable, &rc);
+    if (!h) return rc;
+    rc = CheckTarget(h, r);
+    if (rc == kOk && !injectable)
+        rc = Fail(r, kOpenFailed, "openProcess", "cannot open target with injection rights (access denied); refusing");
+    if (rc == kOk && ModuleLoaded(h, L"AppScale.Native.dll")) {
         r.alreadyInjected = true;
-        return Fail(r, kAlreadyInjected, "alreadyInjected", "AppScale.Native.dll is already loaded in the target; drive it via the protocol");
+        rc = Fail(r, kAlreadyInjected, "alreadyInjected", "AppScale.Native.dll is already loaded in the target; drive it via the protocol");
     }
-    HANDLE h = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ |
-                               SYNCHRONIZE,
-                           FALSE, o.pid);
-    if (!h) return Fail(r, kOpenFailed, "openProcess", "cannot open target for injection (error " + std::to_string(GetLastError()) + ")");
+    if (rc != kOk) {
+        CloseHandle(h);
+        return rc;
+    }
     r.log = o.log.empty() ? DefaultLog(o.pid) : o.log;
     AppScaleSection* s = nullptr;
     DWORD err = 0;
@@ -362,6 +406,7 @@ int Inject(const Options& o, Result& r) {
     }
     const SIZE_T cb = (r.dll.size() + 1) * sizeof(wchar_t);
     void* remote = VirtualAllocEx(h, nullptr, cb, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    bool mayFree = true;
     rc = kOk;
     if (!remote || !WriteProcessMemory(h, remote, r.dll.c_str(), cb, nullptr)) {
         rc = Fail(r, kRemoteLoadFailed, "writeMemory", "cannot write DLL path into target (error " + std::to_string(GetLastError()) + ")");
@@ -372,14 +417,22 @@ int Inject(const Options& o, Result& r) {
         if (!t) {
             rc = Fail(r, kRemoteLoadFailed, "createRemoteThread", "CreateRemoteThread failed (error " + std::to_string(GetLastError()) + ")");
         } else {
-            WaitForSingleObject(t, o.timeoutMs);
+            const DWORD wait = WaitForSingleObject(t, o.timeoutMs);
             DWORD ec = 0;
-            GetExitCodeThread(t, &ec);
+            if (wait != WAIT_OBJECT_0) {
+                // The remote thread may still be about to read the path: deliberately leak the buffer
+                // (a few hundred bytes) rather than free memory LoadLibraryW might still dereference.
+                mayFree = false;
+                rc = Fail(r, kAckTimeout, "loadTimeout",
+                          "remote LoadLibraryW did not finish within the timeout; path buffer intentionally left allocated");
+            } else if (!GetExitCodeThread(t, &ec) || ec == 0 || ec == STILL_ACTIVE) {
+                // The thread exit code is the low 32 bits of the HMODULE; 0 means LoadLibraryW failed.
+                rc = Fail(r, kRemoteLoadFailed, "loadLibrary", "LoadLibraryW failed in the target (thread exit code " + std::to_string(ec) + ")");
+            }
             CloseHandle(t);
-            if (ec == 0) rc = Fail(r, kRemoteLoadFailed, "loadLibrary", "LoadLibraryW returned NULL in the target");
         }
     }
-    if (remote) VirtualFreeEx(h, remote, 0, MEM_RELEASE);
+    if (remote && mayFree) VirtualFreeEx(h, remote, 0, MEM_RELEASE);
     if (rc == kOk) rc = WaitAck(h, s, r, o.timeoutMs);
     UnmapViewOfFile(s);
     CloseHandle(m);
@@ -391,6 +444,17 @@ UINT32 ParseHooks(const wchar_t* v) {
     if (_wcsicmp(v, L"all") == 0) return APPSCALE_HOOK_ALL;
     if (_wcsicmp(v, L"research") == 0) return APPSCALE_HOOK_RESEARCH_SET;
     return static_cast<UINT32>(wcstoul(v, nullptr, 0)) & APPSCALE_HOOK_ALL;
+}
+
+// Strict decimal parse: digits only, whole string, no overflow.
+bool ParseDecimal(const wchar_t* v, unsigned long& out) {
+    if (v == nullptr || *v < L'0' || *v > L'9') return false;
+    wchar_t* end = nullptr;
+    errno = 0;
+    const unsigned long n = wcstoul(v, &end, 10);
+    if (end == v || *end != L'\0' || errno == ERANGE) return false;
+    out = n;
+    return true;
 }
 
 void Usage() {
@@ -422,11 +486,21 @@ int wmain(int argc, wchar_t** argv) {
             o.launchExe = v;
             haveMode = true;
         } else if ((a == L"--inject" || a == L"--check") && (v = next())) {
-            o.pid = wcstoul(v, nullptr, 10);
+            unsigned long pid = 0;
+            if (!ParseDecimal(v, pid) || pid == 0) {
+                Usage();
+                return Fail(r, kUsage, "usage", "--inject/--check need a decimal process id");
+            }
+            o.pid = pid;
             (a == L"--inject" ? o.inject : o.check) = true;
             haveMode = true;
         } else if (a == L"--dpi" && (v = next())) {
-            o.dpi = wcstoul(v, nullptr, 10);
+            unsigned long dpi = 0;
+            if (!ParseDecimal(v, dpi)) {
+                Usage();
+                return Fail(r, kUsage, "usage", "--dpi must be 0 or 72..240");
+            }
+            o.dpi = dpi;
         } else if (a == L"--log" && (v = next())) {
             o.log = v;
         } else if (a == L"--hooks" && (v = next())) {
@@ -434,7 +508,12 @@ int wmain(int argc, wchar_t** argv) {
         } else if (a == L"--cwd" && (v = next())) {
             o.cwd = v;
         } else if (a == L"--timeout" && (v = next())) {
-            o.timeoutMs = wcstoul(v, nullptr, 10);
+            unsigned long t = 0;
+            if (!ParseDecimal(v, t) || t < kMinTimeoutMs || t > kMaxTimeoutMs) {
+                Usage();
+                return Fail(r, kUsage, "usage", "--timeout must be an integer number of milliseconds in 1000..600000");
+            }
+            o.timeoutMs = t;
         } else if (a == L"--include-system-callers") {
             o.includeSystemCallers = true;
         } else {
@@ -453,7 +532,14 @@ int wmain(int argc, wchar_t** argv) {
     if (o.check) {
         r.mode = "check";
         r.pid = o.pid;
-        int rc = CheckTarget(o.pid, r);
+        bool injectable = false;
+        int rc = kOk;
+        HANDLE h = OpenTarget(o.pid, r, &injectable, &rc);
+        if (!h) return rc;
+        rc = CheckTarget(h, r);
+        CloseHandle(h);
+        if (rc == kOk && !injectable)
+            return Fail(r, kOpenFailed, "openProcess", "cannot open target with injection rights (access denied)");
         return rc == kOk ? Emit(r) : rc;
     }
     if (o.inject) return Inject(o, r);

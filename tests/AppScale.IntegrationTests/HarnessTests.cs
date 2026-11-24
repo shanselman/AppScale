@@ -39,6 +39,7 @@ public sealed class HarnessTests : IDisposable
 
     private string RequireHarness(string name)
     {
+        TestHostDpi.SkipIfUnsuitableDesktop();
         string? exe = HarnessPath(name);
         if (exe is null)
         {
@@ -161,6 +162,7 @@ public sealed class HarnessTests : IDisposable
     [SkippableFact]
     public void NonCooperativeWindowGetsNoNativeBackend()
     {
+        TestHostDpi.SkipIfUnsuitableDesktop();
         // A harness launched normally is cooperative; WindowInspector of a non-cooperative process
         // (this test host has no windows) is covered by probing a fake target instead.
         var ctl = Controller();
@@ -193,6 +195,7 @@ public sealed class SelfTestHarnessTests
     [MemberData(nameof(SelfTests))]
     public void HarnessSelfTestPasses(string harness, string mode)
     {
+        TestHostDpi.SkipIfUnsuitableDesktop();
         string? exe = HarnessTests.HarnessPath(harness);
         if (exe is null)
         {

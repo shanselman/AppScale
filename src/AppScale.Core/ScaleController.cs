@@ -12,11 +12,11 @@ namespace AppScale.Core;
 /// </summary>
 public sealed class ScaleController(SettingsStore store, IReadOnlyList<IScaleBackend> backends)
 {
-    private readonly Dictionary<nint, (TargetInfo Target, IScaleBackend Backend)> _applied = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<nint, (TargetInfo Target, IScaleBackend Backend)> _applied = new();
 
     public SettingsStore Store => store;
     public IReadOnlyList<IScaleBackend> Backends => backends;
-    public IReadOnlyCollection<(TargetInfo Target, IScaleBackend Backend)> Applied => _applied.Values;
+    public IReadOnlyCollection<(TargetInfo Target, IScaleBackend Backend)> Applied => _applied.Values.ToList();
 
     public static IReadOnlyList<IScaleBackend> DefaultBackends(IVisualPreviewHost? previewHost) =>
         [new CooperativeBackend(), new InjectionBackend(), new VisualPreviewBackend(previewHost)];
@@ -54,7 +54,7 @@ public sealed class ScaleController(SettingsStore store, IReadOnlyList<IScaleBac
 
     public ScaleResult Reset(TargetInfo target)
     {
-        if (_applied.Remove(target.Hwnd, out var entry)) return entry.Backend.Reset(target);
+        if (_applied.TryRemove(target.Hwnd, out var entry)) return entry.Backend.Reset(target);
         // Not applied by this controller instance (e.g. CLI): reset any cooperative override anyway.
         return target.IsCooperative ? new CooperativeBackend().Reset(target) : ScaleResult.Ok("Nothing to reset.");
     }
@@ -68,8 +68,8 @@ public sealed class ScaleController(SettingsStore store, IReadOnlyList<IScaleBac
     /// <summary>Resets every override this controller applied. Used on exit and by emergency disable.</summary>
     public IReadOnlyList<ScaleResult> ResetAll()
     {
-        var results = _applied.Values.Select(e => e.Backend.Reset(e.Target)).ToList();
-        _applied.Clear();
+        var results = new List<ScaleResult>();
+        foreach (var hwnd in _applied.Keys.ToList()) if (_applied.TryRemove(hwnd, out var e)) results.Add(e.Backend.Reset(e.Target));
         return results;
     }
 

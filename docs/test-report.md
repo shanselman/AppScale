@@ -22,6 +22,22 @@ These are the third-party results summarized in [compatibility.md](compatibility
 - **No change:** 7-Zip (system-aware) and VLC (Qt 5, PMv1, live).
 - **Correctly refused:** Audacity (unaware).
 
+## Continuous integration
+
+GitHub Actions (`windows-latest`) builds native and managed code and gates on the unit tests. The integration tests
+**skip themselves there, with a stated reason**, because hosted runners are a poor fit:
+
+- They run **elevated**. AppScale refuses elevated targets by design, and launched harnesses inherit elevation.
+- They have a **1024×768** display.
+
+The first CI run, before the skip was added, showed both effects: `FAILED (Elevated)` refusals, and harness self-test
+failures where Windows clamped the windows at 192–240 DPI.
+
+**Finding: on small displays, upscaling can push controls off-screen.** On a 1024×768 screen, Windows clamped the
+WinForms harness client area to 1028 px at 200 % and 250 %, and the ListView was no longer reachable by hit-testing.
+AppScale does **not** yet warn when the requested scale won't fit the work area. That is a prerequisite before any
+interactive release.
+
 ## Not measured
 
 The following are **not validated**. AppScale must not be described as an accessibility solution until they are:

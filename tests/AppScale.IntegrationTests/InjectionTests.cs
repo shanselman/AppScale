@@ -29,6 +29,7 @@ public sealed class InjectionTests : IDisposable
 
     private static void RequireOrSkip(bool present, string what)
     {
+        TestHostDpi.SkipIfUnsuitableDesktop();
         if (present) return;
         Assert.False(Environment.GetEnvironmentVariable("APPSCALE_REQUIRE_HARNESSES") == "1", $"{what} not built");
         Skip.If(true, $"{what} not built; run scripts\\build.ps1 first.");

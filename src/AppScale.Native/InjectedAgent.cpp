@@ -318,7 +318,10 @@ std::string StatsString() {
 void InstallAndAck() {
     const bool includeSystem = (g_section->flags & APPSCALE_SECTIONFLAG_INCLUDE_SYSTEM_CALLERS) != 0;
     UINT32 mask = g_section->hookMask ? g_section->hookMask : APPSCALE_HOOK_ALL;
-    HRESULT hr = InstallProcessWide(mask, g_section->requestedDpi, includeSystem);
+    // Inject mode: other threads are live, so Detours must suspend them and fix up their IPs.
+    // Launch mode (from DllMain, before main runs) has no other application threads to suspend.
+    const bool suspendOthers = g_section->loadMode == APPSCALE_LOAD_INJECT;
+    HRESULT hr = InstallProcessWide(mask, g_section->requestedDpi, includeSystem, suspendOthers);
     g_section->hr = hr;
     InterlockedExchange(&g_section->effectiveDpi, SUCCEEDED(hr) ? static_cast<LONG>(g_section->requestedDpi) : 0);
     InterlockedExchange(&g_section->ack, SUCCEEDED(hr) ? APPSCALE_ACK_HOOKED : APPSCALE_ACK_FAILED);
@@ -330,10 +333,10 @@ DWORD WINAPI AgentThread(void*) {
     g_msgGet = RegisterWindowMessageW(L"AppScale.GetDpi.v1");
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    char f[200];
-    sprintf_s(f, ",\"loadMode\":%u,\"requestedDpi\":%u,\"hookMask\":%u,\"flags\":%u,\"hr\":%ld,\"ack\":%ld,\"realSystemDpi\":%u,\"exe\":\"",
+    char f[240];
+    sprintf_s(f, ",\"loadMode\":%u,\"requestedDpi\":%u,\"hookMask\":%u,\"flags\":%u,\"hr\":%ld,\"ack\":%ld,\"realSystemDpi\":%u,\"threadsUpdatedAtInstall\":%u,\"exe\":\"",
               g_section->loadMode, g_section->requestedDpi, g_section->hookMask, g_section->flags, g_section->hr, g_section->ack,
-              RealGetDpiForSystem());
+              RealGetDpiForSystem(), ThreadsUpdatedAtInstall());
     Log("agentStart", std::string(f + 1) + Utf8(exe) + "\"");
     if (g_section->ack != APPSCALE_ACK_HOOKED) return 0;
 

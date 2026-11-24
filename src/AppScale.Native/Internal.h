@@ -13,7 +13,8 @@ UINT32 EffectiveDpi();              // 0 = following the OS
 void SetEffectiveDpiInternal(UINT32 dpi);
 
 // Installs hooks for the whole process (ownerThread = 0). Returns an HRESULT.
-HRESULT InstallProcessWide(UINT32 installMask, UINT32 effectiveDpi, bool includeSystemCallers);
+HRESULT InstallProcessWide(UINT32 installMask, UINT32 effectiveDpi, bool includeSystemCallers, bool suspendOtherThreads);
+UINT32 ThreadsUpdatedAtInstall();
 UINT32 InstalledMask();
 // UTF-8 JSON statistics (same shape as AppScaleNative_GetStatsJson).
 void StatsJson(char* buffer, UINT32 cb, UINT32* needed);
